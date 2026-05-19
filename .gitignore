@@ -1,0 +1,27 @@
+# Embeddings e resultados gerados
+cache/
+results/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Ambientes
+.venv/
+venv/
+.env
+.envrc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# W&B / logs
+wandb/
+*.log
+
+# Editor
+.vscode/
+.idea/

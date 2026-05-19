@@ -1,0 +1,33 @@
+prompts:
+
+  # Sem prompt de texto (só imagem — baseline puro de visão)
+  no_prompt: ""
+
+  # Prompts curtos / diretos
+  minimal: "document"
+  analyze: "Analyze this document."
+  classify: "What type of document is this?"
+  category: "Identify the document category."
+
+  # Prompts orientados à tarefa
+  describe_layout: "Describe the visual layout and content of this document."
+  describe_visual: "Describe the visual features of this image."
+  ocr_task: "Read the text in this document."
+
+  # Prompt longo / detalhado
+  detailed: >-
+    This is a document image. Describe its content, structure,
+    visual layout, and document type in detail.
+
+  # Prompt generativo — pede classificação explícita com lista de classes
+  # Usado em generate_classify.py (geração de texto) e também como prompt de embedding
+  generative_classify: >-
+    What type of document is this? Choose exactly one from this list:
+    letter, form, email, handwritten, advertisement, scientific report,
+    scientific publication, specification, file folder, news article,
+    budget, invoice, presentation, questionnaire, resume, memo.
+    Answer with only the document type, nothing else.
+
+  # Controle: prompt completamente irrelevante (ablação)
+  # Esperado: embedding não melhor que no_prompt; geração → acurácia ~0%
+  unrelated: "How much is 2 + 2?"

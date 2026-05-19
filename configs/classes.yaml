@@ -1,0 +1,67 @@
+# Descrições textuais das 16 classes do RVL-CDIP (índice = label do dataset)
+# Usadas para criar embeddings de referência via mean pool (sem imagem)
+
+classes:
+  - label: 0
+    key: letter
+    description: "This document is a formal or informal letter addressed to a person or organization."
+
+  - label: 1
+    key: form
+    description: "This document is a structured form with blank fields to be filled in."
+
+  - label: 2
+    key: email
+    description: "This document is an email printout with headers such as From, To, Subject, and Date."
+
+  - label: 3
+    key: handwritten
+    description: "This document is handwritten, with text written by hand rather than typed."
+
+  - label: 4
+    key: advertisement
+    description: "This document is an advertisement, a promotional page for a product, service, or event."
+
+  - label: 5
+    key: scientific_report
+    description: "This document is a scientific or technical report presenting research methodology and findings."
+
+  - label: 6
+    key: scientific_publication
+    description: "This document is a scientific journal article with abstract, structured sections, and references."
+
+  - label: 7
+    key: specification
+    description: "This document is a technical specification describing requirements, standards, or system details."
+
+  - label: 8
+    key: file_folder
+    description: "This is a file folder label or document tab used for organizing archival files."
+
+  - label: 9
+    key: news_article
+    description: "This document is a news article from a newspaper or news publication."
+
+  - label: 10
+    key: budget
+    description: "This document is a budget report with financial tables, figures, and monetary values."
+
+  - label: 11
+    key: invoice
+    description: "This document is an invoice or bill listing products or services rendered and their costs."
+
+  - label: 12
+    key: presentation
+    description: "This document is a presentation slide used for lectures, meetings, or slide decks."
+
+  - label: 13
+    key: questionnaire
+    description: "This document is a questionnaire or survey form with questions to be answered by respondents."
+
+  - label: 14
+    key: resume
+    description: "This document is a resume or curriculum vitae listing education, skills, and work experience."
+
+  - label: 15
+    key: memo
+    description: "This document is an internal business memo or memorandum for intra-organizational communication."

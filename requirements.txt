@@ -1,0 +1,38 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# PyTorch (mesmo ambiente do CaVL-Doc)
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+
+# Transformers / HuggingFace
+transformers>=4.57
+tokenizers>=0.22
+safetensors>=0.5
+huggingface-hub>=0.35
+datasets>=4.4
+accelerate>=1.12
+bitsandbytes>=0.45
+peft>=0.17
+sentencepiece>=0.2
+
+# Dependências específicas de modelos
+timm>=1.0          # InternVL3
+einops>=0.8        # InternVL3
+qwen-vl-utils>=0.0.8  # Qwen2.5-VL
+
+# Ciência
+numpy>=2.0
+pandas>=2.2
+scipy>=1.15
+scikit-learn>=1.7
+pillow>=10.0
+
+# Visualização
+matplotlib>=3.9
+seaborn>=0.13
+
+# Utilitários
+PyYAML>=6.0
+tqdm>=4.67
+python-dotenv>=1.0
+rich>=13.0

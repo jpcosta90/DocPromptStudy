@@ -1,0 +1,24 @@
+models:
+
+  internvl3-2b:
+    hf_path: OpenGVLab/InternVL3-2B
+    family: internvl
+    embed_dim: 1536
+
+  qwen25vl-2b:
+    hf_path: Qwen/Qwen2.5-VL-2B-Instruct
+    family: qwen2vl
+    embed_dim: 1536
+
+  # Gemma 4 ~2B (multimodal — gemma-3n architecture)
+  gemma3n-e2b:
+    hf_path: google/gemma-3n-e2b-it
+    family: gemma
+    embed_dim: 2560
+
+  # Ministral 3 3B — multimodal (LM 3.4B + vision encoder 0.4B)
+  # Base: ministral-3b | Instruct: ministral-3b-instruct
+  ministral-3b:
+    hf_path: mistralai/Ministral-3-3B-Base-2512
+    family: ministral
+    embed_dim: 4096
