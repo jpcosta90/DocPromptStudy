@@ -38,7 +38,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from doc_prompt_study import cache as C
 from doc_prompt_study.extractor import build_extractor
-from doc_prompt_study.rvl_cdip import load_rvl_cdip, RVL_CDIP_CLASSES
+from doc_prompt_study.rvl_cdip import load_rvl_cdip, load_local_rvl_cdip, RVL_CDIP_CLASSES
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -53,13 +53,20 @@ def parse_args():
     p.add_argument("--all-prompts", action="store_true")
     p.add_argument("--only-classes", action="store_true",
                    help="Extrai apenas embeddings das classes (pula imagens)")
-    p.add_argument("--splits", nargs="+", default=["train", "test"],
-                   choices=["train", "validation", "test"])
+    # Fonte de dados: local ou HuggingFace
+    src = p.add_mutually_exclusive_group()
+    src.add_argument("--local-data", metavar="DIR",
+                     help="Pasta local com subpastas por classe (ex.: /mnt/data/zs_rvl_cdip/data)")
+    src.add_argument("--hf-dataset", default="jbxai/rvl-cdip",
+                     help="Dataset HuggingFace (padrão: jbxai/rvl-cdip)")
+    p.add_argument("--local-splits-csv", metavar="CSV", default=None,
+                   help="splits.csv do dataset local (opcional, para filtrar subset)")
+    p.add_argument("--splits", nargs="+", default=["local"],
+                   help="Splits HF ('train','test') ou 'local' para dataset local")
     p.add_argument("--max-per-class", type=int, default=None)
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--no-4bit", action="store_true")
     p.add_argument("--cache-dir", default=str(ROOT / "cache"))
-    p.add_argument("--hf-dataset", default="jbxai/rvl-cdip")
     return p.parse_args()
 
 
@@ -145,7 +152,19 @@ def main():
 
     for split in args.splits:
         logger.info("=== Split: %s (max_per_class=%s) ===", split, args.max_per_class)
-        ds = load_rvl_cdip(split=split, max_per_class=args.max_per_class, hf_dataset=args.hf_dataset)
+
+        if args.local_data:
+            ds = load_local_rvl_cdip(
+                data_dir=args.local_data,
+                splits_csv=args.local_splits_csv,
+                max_per_class=args.max_per_class,
+            )
+        else:
+            ds = load_rvl_cdip(
+                split=split,
+                max_per_class=args.max_per_class,
+                hf_dataset=args.hf_dataset,
+            )
 
         for pid in prompt_ids:
             if pid not in prompts_cfg:

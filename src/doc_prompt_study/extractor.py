@@ -18,67 +18,12 @@ Interface pública de cada extractor:
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 import numpy as np
 import torch
-import torchvision.transforms as T
 from PIL import Image
-from torchvision.transforms.functional import InterpolationMode
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# InternVL image preprocessing (de CaVL-Doc/data/transforms.py)
-# ---------------------------------------------------------------------------
-
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD  = (0.229, 0.224, 0.225)
-
-
-def _build_transform(input_size: int = 448) -> T.Compose:
-    return T.Compose([
-        T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
-        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
-        T.ToTensor(),
-        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ])
-
-
-def _find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
-    best_diff = float("inf")
-    best = (1, 1)
-    area = width * height
-    for r in target_ratios:
-        diff = abs(r[0] / r[1] - aspect_ratio)
-        if diff < best_diff or (diff == best_diff and area > 0.5 * image_size ** 2 * r[0] * r[1]):
-            best_diff = diff
-            best = r
-    return best
-
-
-def _dynamic_preprocess(image: Image.Image, min_num: int = 1, max_num: int = 12,
-                         image_size: int = 448, use_thumbnail: bool = True) -> list[Image.Image]:
-    w, h = image.size
-    ratios = sorted(
-        {(i, j) for n in range(min_num, max_num + 1)
-         for i in range(1, n + 1) for j in range(1, n + 1)
-         if min_num <= i * j <= max_num},
-        key=lambda r: r[0] * r[1],
-    )
-    best = _find_closest_aspect_ratio(w / h, ratios, w, h, image_size)
-    tw, th = best[0] * image_size, best[1] * image_size
-    resized = image.resize((tw, th))
-    cols = tw // image_size
-    blocks = []
-    for i in range(best[0] * best[1]):
-        col, row = i % cols, i // cols
-        box = (col * image_size, row * image_size, (col + 1) * image_size, (row + 1) * image_size)
-        blocks.append(resized.crop(box))
-    if use_thumbnail and len(blocks) != 1:
-        blocks.append(image.resize((image_size, image_size)))
-    return blocks
-
 
 # ---------------------------------------------------------------------------
 # Utilitário de quantização
@@ -164,10 +109,12 @@ class BaseExtractor:
 
 class InternVLExtractor(BaseExtractor):
     INPUT_SIZE = 448
-    MAX_NUM = 12
+    MAX_NUM = 6  # same as CaVL-Doc; avoids patch/token count mismatch with larger values
 
     def load(self):
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        from cavl_doc.data.transforms import dynamic_preprocess, build_transform
+        from cavl_doc.utils.embedding_utils import prepare_inputs_for_multimodal_embedding
 
         quant = _quant_config() if self.load_in_4bit else None
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -180,36 +127,31 @@ class InternVLExtractor(BaseExtractor):
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.hf_path, trust_remote_code=True, use_fast=False
         )
-        self._transform = _build_transform(self.INPUT_SIZE)
-        self._img_ctx_id = self.tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+        self._transform = build_transform(self.INPUT_SIZE)
+        self._dynamic_preprocess = dynamic_preprocess
+        self._prepare_inputs = prepare_inputs_for_multimodal_embedding
+        self.model.img_context_token_id = self.tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
         logger.info("InternVL3 carregado: %s", self.hf_path)
 
     def _preprocess(self, image: Image.Image) -> torch.Tensor:
-        blocks = _dynamic_preprocess(
+        blocks = self._dynamic_preprocess(
             image, max_num=self.MAX_NUM, image_size=self.INPUT_SIZE, use_thumbnail=True
         )
         return torch.stack([self._transform(b) for b in blocks])  # [N, 3, H, W]
 
     def extract_image(self, image, prompt, layers=(0, -1)):
-        pv = self._preprocess(image).to(self.model.device, dtype=torch.bfloat16)
-        num_patches = pv.shape[0]
-        img_tokens = "<img>" + "<IMG_CONTEXT>" * self.model.num_image_token * num_patches + "</img>"
-        query = img_tokens + "\n" + prompt if prompt else img_tokens
-        enc = self.tokenizer(query, return_tensors="pt").to(self.model.device)
-        image_flags = torch.ones(num_patches, dtype=torch.long, device=self.model.device)
-
+        pv = self._preprocess(image).to(torch.bfloat16)
+        inp = self._prepare_inputs(self.model, self.tokenizer, pv, prompt or "")
         with torch.no_grad():
             out = self.model(
-                input_ids=enc.input_ids,
-                attention_mask=enc.attention_mask,
-                pixel_values=pv,
-                image_flags=image_flags,
+                input_ids=inp["input_ids"],
+                pixel_values=inp["pixel_values"],
+                image_flags=inp["image_flags"],
                 output_hidden_states=True,
                 return_dict=True,
             )
-        visual_mask = (enc.input_ids == self._img_ctx_id)  # [1, seq]
         return {
-            li: _mean_pool_layer(out.hidden_states, li, visual_mask).numpy()
+            li: _mean_pool_layer(out.hidden_states, li, None).numpy()
             for li in layers
         }
 
@@ -228,22 +170,21 @@ class InternVLExtractor(BaseExtractor):
         }
 
     def generate_text(self, image, prompt, max_new_tokens=40):
-        pv = self._preprocess(image).to(self.model.device, dtype=torch.bfloat16)
-        num_patches = pv.shape[0]
-        img_tokens = "<img>" + "<IMG_CONTEXT>" * self.model.num_image_token * num_patches + "</img>"
-        query = img_tokens + "\n" + prompt if prompt else img_tokens
-        enc = self.tokenizer(query, return_tensors="pt").to(self.model.device)
-        image_flags = torch.ones(num_patches, dtype=torch.long, device=self.model.device)
+        pv = self._preprocess(image).to(torch.bfloat16)
+        inp = self._prepare_inputs(
+            self.model, self.tokenizer, pv, prompt or "Describe this document."
+        )
         with torch.no_grad():
-            out = self.model.generate(
-                input_ids=enc.input_ids,
-                attention_mask=enc.attention_mask,
-                pixel_values=pv,
-                image_flags=image_flags,
+            generated = self.model.generate(
+                input_ids=inp["input_ids"],
+                pixel_values=inp["pixel_values"],
+                image_flags=inp["image_flags"],
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
             )
-        return self.tokenizer.decode(out[0][enc.input_ids.shape[1]:], skip_special_tokens=True).strip()
+        return self.tokenizer.decode(
+            generated[0][inp["input_ids"].shape[1]:], skip_special_tokens=True
+        ).strip()
 
 
 # ---------------------------------------------------------------------------
