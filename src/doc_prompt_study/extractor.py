@@ -45,12 +45,16 @@ def _mean_pool_layer(hidden_states: tuple, layer_idx: int, token_mask: torch.Ten
     layer_idx: 0 = embedding layer, -1 = última camada
     token_mask: bool [1, seq] — True nas posições a pooler (None = todos)
     Retorna tensor [dim] float32 na CPU.
+
+    Gemma-3n AltUp returns [1, num_paths, seq, dim] — flattened to [1, N, dim] before pooling.
     """
-    h = hidden_states[layer_idx]  # [1, seq, dim]
+    h = hidden_states[layer_idx]
+    dim = h.shape[-1]
+    h_flat = h.reshape(h.shape[0], -1, dim)  # [1, N, dim] — handles both 3D and 4D
     if token_mask is not None and token_mask.any():
-        vt = h[token_mask].mean(dim=0)
+        vt = h_flat[0][token_mask[0]].mean(dim=0)
     else:
-        vt = h[0].mean(dim=0)
+        vt = h_flat[0].mean(dim=0)
     return vt.cpu().float()
 
 
@@ -265,21 +269,22 @@ class GemmaExtractor(BaseExtractor):
         self._img_token_id: int | None = getattr(self.model.config, "image_token_id", None)
         logger.info("Gemma multimodal carregado: %s", self.hf_path)
 
-    def extract_image(self, image, prompt, layers=(0, -1)):
-        effective_prompt = prompt if prompt else "Describe this document."
-        inputs = self.processor(text=effective_prompt, images=image, return_tensors="pt").to(self.model.device)
+    def _make_inputs(self, image, prompt):
+        messages = [{"role": "user", "content": [
+            {"type": "image"},
+            {"type": "text", "text": prompt or "Describe this document."},
+        ]}]
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        return self.processor(text=text, images=image, return_tensors="pt").to(self.model.device)
 
+    def extract_image(self, image, prompt, layers=(0, -1)):
+        inputs = self._make_inputs(image, prompt)
         with torch.no_grad():
             out = self.model(**inputs, output_hidden_states=True, return_dict=True)
-
-        visual_mask = None
-        if self._img_token_id is not None:
-            m = (inputs.input_ids == self._img_token_id)
-            if m.any():
-                visual_mask = m
-
         return {
-            li: _mean_pool_layer(out.hidden_states, li, visual_mask).numpy()
+            li: _mean_pool_layer(out.hidden_states, li, None).numpy()
             for li in layers
         }
 
@@ -293,8 +298,14 @@ class GemmaExtractor(BaseExtractor):
         }
 
     def generate_text(self, image, prompt, max_new_tokens=40):
-        effective_prompt = prompt if prompt else "Describe this document."
-        inputs = self.processor(text=effective_prompt, images=image, return_tensors="pt").to(self.model.device)
+        messages = [{"role": "user", "content": [
+            {"type": "image"},
+            {"type": "text", "text": prompt or "Describe this document."},
+        ]}]
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.processor(text=text, images=image, return_tensors="pt").to(self.model.device)
         with torch.no_grad():
             out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
         return self.processor.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
