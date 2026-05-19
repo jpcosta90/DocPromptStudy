@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-Classificação zero-shot via cosine similarity entre embeddings de imagem e de classe.
+Classificação via centroide: para cada imagem, computa cosine similarity
+contra o centroide de cada classe e prediz a classe mais próxima.
 
-Para cada imagem: predict = argmax_c cosine(embed_image, embed_class_c)
-Nenhum treinamento — pure similarity matching.
+Os centroides são computados a partir dos embeddings das outras imagens
+(leave-one-out), garantindo avaliação justa mesmo sem split treino/teste.
 
 Uso:
   python scripts/classify.py \\
       --model internvl3-2b \\
       --all-prompts \\
       --layer last \\
-      --split test \\
-      --output results/results.csv
+      --split local
 
-  # Comparar camada 0 vs última:
+  # Comparar layer 0 vs última:
   python scripts/classify.py --model internvl3-2b --all-prompts --layer 0 last
 
-  # Múltiplos modelos de uma vez:
+  # Múltiplos modelos:
   python scripts/classify.py \\
       --model internvl3-2b qwen25vl-2b \\
       --prompt-ids no_prompt classify \\
@@ -44,28 +44,61 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 LAYER_ALIASES = {"0": 0, "last": -1, "-1": -1, "first": 0}
+N_CLASSES = 16
 
 
-def cosine_classify(
-    img_embs: np.ndarray,  # [N, dim]
-    cls_embs: np.ndarray,  # [16, dim]
-) -> np.ndarray:
-    """Retorna predições [N] — índice da classe com maior cosine similarity."""
-    # Normaliza L2
-    img_n = img_embs / (np.linalg.norm(img_embs, axis=1, keepdims=True) + 1e-8)
-    cls_n = cls_embs / (np.linalg.norm(cls_embs, axis=1, keepdims=True) + 1e-8)
-    # Similaridade: [N, 16]
-    sims = img_n @ cls_n.T
-    return sims.argmax(axis=1)
+def _l2_normalize(x: np.ndarray) -> np.ndarray:
+    return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
+
+
+def centroid_classify_loo(img_embs: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    """
+    Classificação por centroide com leave-one-out.
+
+    Para cada imagem i:
+      - Calcula o centroide de cada classe excluindo a imagem i
+      - Prediz a classe com maior cosine similarity ao centroide
+
+    Retorna array de predições [N].
+    """
+    N, D = img_embs.shape
+    embs_n = _l2_normalize(img_embs)  # [N, D] normalizado
+    preds = np.empty(N, dtype=np.int64)
+
+    # Pré-computa soma por classe (para subtrair a imagem i eficientemente)
+    class_sums   = np.zeros((N_CLASSES, D))
+    class_counts = np.zeros(N_CLASSES, dtype=np.int64)
+    for i in range(N):
+        c = labels[i]
+        class_sums[c]   += img_embs[i]
+        class_counts[c] += 1
+
+    for i in range(N):
+        c_i = labels[i]
+        # Centroide de cada classe sem a imagem i
+        centroids = class_sums.copy()
+        centroids[c_i] -= img_embs[i]
+        counts = class_counts.copy()
+        counts[c_i] -= 1
+
+        # Evita divisão por zero (classe com só 1 exemplo)
+        safe_counts = np.where(counts > 0, counts, 1)
+        centroids /= safe_counts[:, None]
+
+        centroids_n = _l2_normalize(centroids)  # [16, D]
+        sims = embs_n[i] @ centroids_n.T        # [16]
+        preds[i] = sims.argmax()
+
+    return preds
 
 
 def accuracy(preds: np.ndarray, labels: np.ndarray) -> float:
     return float((preds == labels).mean())
 
 
-def per_class_accuracy(preds, labels, n_classes=16) -> dict[str, float]:
+def per_class_accuracy(preds: np.ndarray, labels: np.ndarray) -> dict[str, float]:
     result = {}
-    for c in range(n_classes):
+    for c in range(N_CLASSES):
         mask = labels == c
         if mask.sum() == 0:
             continue
@@ -80,7 +113,7 @@ def parse_args():
     p.add_argument("--all-prompts", action="store_true")
     p.add_argument("--layer", nargs="+", default=["last"],
                    help="Índices de camada: '0' (embedding) ou 'last' / '-1' (última)")
-    p.add_argument("--split", default="test", choices=["train", "validation", "test"])
+    p.add_argument("--split", default="test")
     p.add_argument("--cache-dir", default=str(ROOT / "cache"))
     p.add_argument("--output", default=str(ROOT / "results" / "results.csv"))
     p.add_argument("--per-class", action="store_true", help="Imprime acurácia por classe")
@@ -90,16 +123,12 @@ def parse_args():
 def run_one(cache_dir, model, prompt_id, layer_idx, split, per_class=False):
     img_data = C.img_load(cache_dir, model, prompt_id, split, layer_idx)
     if img_data is None:
-        logger.warning("Cache ausente: %s / %s / %s / layer%s — rode extract_embeddings.py.", model, prompt_id, split, layer_idx)
-        return None
-
-    cls_embs = C.cls_load_all(cache_dir, model, layer_idx)
-    if cls_embs is None:
-        logger.warning("Embeddings de classe ausentes para %s / layer%s — rode extract_embeddings.py --only-classes.", model, layer_idx)
+        logger.warning("Cache ausente: %s / %s / %s / layer%s — rode extract_embeddings.py.",
+                       model, prompt_id, split, layer_idx)
         return None
 
     img_embs, labels = img_data
-    preds = cosine_classify(img_embs, cls_embs)
+    preds = centroid_classify_loo(img_embs, labels)
     acc   = accuracy(preds, labels)
 
     if per_class:
@@ -140,12 +169,12 @@ def main():
                 if acc is not None:
                     logger.info("  Accuracy: %.4f", acc)
                     rows.append({
-                        "model":       model,
-                        "prompt_id":   pid,
-                        "prompt":      prompts_cfg.get(pid, ""),
-                        "layer":       layer_label,
-                        "split":       args.split,
-                        "accuracy":    f"{acc:.6f}",
+                        "model":     model,
+                        "prompt_id": pid,
+                        "prompt":    prompts_cfg.get(pid, ""),
+                        "layer":     layer_label,
+                        "split":     args.split,
+                        "accuracy":  f"{acc:.6f}",
                     })
 
     if not rows:
@@ -161,7 +190,6 @@ def main():
         writer.writerows(rows)
     logger.info("Resultados salvos em %s", args.output)
 
-    # Ranking rápido no terminal
     rows_sorted = sorted(rows, key=lambda r: float(r["accuracy"]), reverse=True)
     print("\n=== Ranking (accuracy ↓) ===")
     for r in rows_sorted:

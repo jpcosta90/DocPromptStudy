@@ -5,10 +5,10 @@ models:
     family: internvl
     embed_dim: 1536
 
-  qwen25vl-2b:
-    hf_path: Qwen/Qwen2.5-VL-2B-Instruct
+  qwen25vl-3b:
+    hf_path: Qwen/Qwen2.5-VL-3B-Instruct
     family: qwen2vl
-    embed_dim: 1536
+    embed_dim: 2048
 
   # Gemma 4 ~2B (multimodal — gemma-3n architecture)
   gemma3n-e2b:

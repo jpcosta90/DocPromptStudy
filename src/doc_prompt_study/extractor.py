@@ -170,21 +170,13 @@ class InternVLExtractor(BaseExtractor):
         }
 
     def generate_text(self, image, prompt, max_new_tokens=40):
-        pv = self._preprocess(image).to(torch.bfloat16)
-        inp = self._prepare_inputs(
-            self.model, self.tokenizer, pv, prompt or "Describe this document."
+        pv = self._preprocess(image).to(self.model.device, dtype=torch.bfloat16)
+        return self.model.chat(
+            self.tokenizer,
+            pv,
+            prompt or "Describe this document.",
+            generation_config={"max_new_tokens": max_new_tokens, "do_sample": False},
         )
-        with torch.no_grad():
-            generated = self.model.generate(
-                input_ids=inp["input_ids"],
-                pixel_values=inp["pixel_values"],
-                image_flags=inp["image_flags"],
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-            )
-        return self.tokenizer.decode(
-            generated[0][inp["input_ids"].shape[1]:], skip_special_tokens=True
-        ).strip()
 
 
 # ---------------------------------------------------------------------------

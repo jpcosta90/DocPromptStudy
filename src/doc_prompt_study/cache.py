@@ -80,7 +80,8 @@ def cls_load_all(cache_dir, model, layer_idx, n_classes: int = 16) -> np.ndarray
     """Carrega matriz [n_classes, dim] com todos os embeddings de classe, em ordem de label."""
     from doc_prompt_study.rvl_cdip import RVL_CDIP_CLASSES
     embs = []
-    for key in RVL_CDIP_CLASSES:
+    for name in RVL_CDIP_CLASSES:
+        key = name.replace(" ", "_")  # "scientific report" → "scientific_report"
         e = cls_load(cache_dir, model, key, layer_idx)
         if e is None:
             return None
