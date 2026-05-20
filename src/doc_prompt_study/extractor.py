@@ -317,7 +317,11 @@ class GemmaExtractor(BaseExtractor):
 
 class Ministral3Extractor(BaseExtractor):
     def load(self):
-        from transformers import Mistral3ForConditionalGeneration, AutoProcessor
+        from transformers import Mistral3ForConditionalGeneration, AutoProcessor, MistralConfig
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        # "ministral3" (text subconfig type in Ministral-3B) isn't registered in older transformers
+        if "ministral3" not in CONFIG_MAPPING:
+            CONFIG_MAPPING.register("ministral3", MistralConfig, exist_ok=True)
 
         quant = _quant_config() if self.load_in_4bit else None
         self.model = Mistral3ForConditionalGeneration.from_pretrained(
@@ -330,22 +334,33 @@ class Ministral3Extractor(BaseExtractor):
         self._img_token_id: int | None = getattr(self.model.config, "image_token_id", None)
         logger.info("Ministral3 carregado: %s  img_token_id=%s", self.hf_path, self._img_token_id)
 
+    def _has_chat_template(self):
+        tmpl = getattr(self.processor, "chat_template", None)
+        return tmpl is not None
+
     def extract_image(self, image, prompt, layers=(0, -1)):
-        conversation = [{"role": "user", "content": [
-            {"type": "image", "image": image},
-            {"type": "text",  "text":  prompt or ""},
-        ]}]
-        text = self.processor.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=False
-        )
+        if self._has_chat_template():
+            conversation = [{"role": "user", "content": [
+                {"type": "image", "image": image},
+                {"type": "text",  "text":  prompt or ""},
+            ]}]
+            text = self.processor.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=False
+            )
+        else:
+            # Base model (PixtralProcessor) — prepend [IMG] placeholder manually
+            img_tok = getattr(self.processor, "image_token", "[IMG]")
+            text = f"{img_tok}\n{prompt}" if prompt else img_tok
         inputs = self.processor(text=text, images=image, return_tensors="pt").to(self.model.device)
+        model_dtype = next(self.model.parameters()).dtype
+        inputs = {k: v.to(dtype=model_dtype) if torch.is_floating_point(v) else v for k, v in inputs.items()}
 
         with torch.no_grad():
             out = self.model(**inputs, output_hidden_states=True, return_dict=True)
 
         visual_mask = None
         if self._img_token_id is not None:
-            m = (inputs.input_ids == self._img_token_id)
+            m = (inputs["input_ids"] == self._img_token_id)
             if m.any():
                 visual_mask = m
 
@@ -364,17 +379,23 @@ class Ministral3Extractor(BaseExtractor):
         }
 
     def generate_text(self, image, prompt, max_new_tokens=40):
-        conversation = [{"role": "user", "content": [
-            {"type": "image", "image": image},
-            {"type": "text",  "text":  prompt or ""},
-        ]}]
-        text = self.processor.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=True
-        )
+        if self._has_chat_template():
+            conversation = [{"role": "user", "content": [
+                {"type": "image", "image": image},
+                {"type": "text",  "text":  prompt or ""},
+            ]}]
+            text = self.processor.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            img_tok = getattr(self.processor, "image_token", "[IMG]")
+            text = f"{img_tok}\n{prompt}" if prompt else img_tok
         inputs = self.processor(text=text, images=image, return_tensors="pt").to(self.model.device)
+        model_dtype = next(self.model.parameters()).dtype
+        inputs = {k: v.to(dtype=model_dtype) if torch.is_floating_point(v) else v for k, v in inputs.items()}
         with torch.no_grad():
             out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-        return self.processor.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
+        return self.processor.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
 
 
 # ---------------------------------------------------------------------------
