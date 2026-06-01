@@ -65,6 +65,26 @@ def parse_args():
 # Carregamento
 # ---------------------------------------------------------------------------
 
+def load_internvl(hf_path: str):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    model = AutoModelForCausalLM.from_pretrained(
+        hf_path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="eager",
+    ).eval()
+    tokenizer = AutoTokenizer.from_pretrained(
+        hf_path, trust_remote_code=True, use_fast=False
+    )
+    # Obrigatório para o forward pass do InternVL (substitui os IMG_CONTEXT no embedding)
+    model.img_context_token_id = tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+    # Garante eager no LM interno (Qwen2)
+    if hasattr(model, "language_model") and hasattr(model.language_model, "config"):
+        model.language_model.config._attn_implementation = "eager"
+    return model, tokenizer
+
+
 def load_qwen2vl(hf_path: str):
     from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -75,6 +95,102 @@ def load_qwen2vl(hf_path: str):
     ).eval()
     processor = AutoProcessor.from_pretrained(hf_path)
     return model, processor
+
+
+# ---------------------------------------------------------------------------
+# InternVL3 — preparação e geração
+# ---------------------------------------------------------------------------
+
+_INTERNVL_MAX_NUM  = 12
+_INTERNVL_IMG_SIZE = 448
+
+
+def _internvl_patch_grid(image: Image.Image):
+    """Retorna (rows, cols) do grid de patches para a imagem."""
+    from cavl_doc.data.transforms import find_closest_aspect_ratio
+    w, h = image.size
+    ratios = sorted(
+        {(i, j) for n in range(1, _INTERNVL_MAX_NUM + 1)
+         for i in range(1, n + 1) for j in range(1, n + 1)
+         if 1 <= i * j <= _INTERNVL_MAX_NUM},
+        key=lambda r: r[0] * r[1],
+    )
+    # find_closest_aspect_ratio retorna (cols, rows) — [0]=largura, [1]=altura
+    cols, rows = find_closest_aspect_ratio(w / h, ratios, w, h, _INTERNVL_IMG_SIZE)
+    return rows, cols
+
+
+def prepare_internvl(model, tokenizer, image: Image.Image, prompt: str):
+    """
+    Retorna:
+      inp           — dict com input_ids, pixel_values, image_flags
+      img_pos       — posições dos tokens <IMG_CONTEXT> (CPU)
+      all_text_pos  — posições de todos os tokens de texto (= user_pos, sem seção system)
+      user_pos      — idem
+      rows, cols    — grid espacial de patches (excluindo thumbnail)
+      n_img_token   — tokens por patch (256)
+      sys_text      — "" (InternVL não usa system section neste formato)
+    """
+    from cavl_doc.data.transforms import dynamic_preprocess, build_transform
+    from cavl_doc.utils.embedding_utils import prepare_inputs_for_multimodal_embedding
+
+    transform = build_transform(_INTERNVL_IMG_SIZE)
+    blocks    = dynamic_preprocess(
+        image, max_num=_INTERNVL_MAX_NUM,
+        image_size=_INTERNVL_IMG_SIZE, use_thumbnail=True
+    )
+    pv = torch.stack([transform(b) for b in blocks]).to(torch.bfloat16)
+
+    rows, cols  = _internvl_patch_grid(image)
+    n_img_token = model.num_image_token   # 256
+
+    inp = prepare_inputs_for_multimodal_embedding(model, tokenizer, pv, prompt)
+
+    img_ctx_id = tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+    seq        = inp["input_ids"][0].cpu()
+    img_pos    = (seq == img_ctx_id).nonzero(as_tuple=True)[0]
+    text_pos   = (seq != img_ctx_id).nonzero(as_tuple=True)[0]
+
+    return inp, img_pos, text_pos, text_pos, rows, cols, n_img_token, ""
+
+
+def generate_response_internvl(model, tokenizer, image: Image.Image,
+                                prompt: str, max_new_tokens: int = 50) -> str:
+    """Geração com formato de chat correto (internvl2_5 + Qwen2 backbone)."""
+    from cavl_doc.data.transforms import dynamic_preprocess, build_transform
+
+    transform = build_transform(_INTERNVL_IMG_SIZE)
+    blocks    = dynamic_preprocess(
+        image, max_num=_INTERNVL_MAX_NUM,
+        image_size=_INTERNVL_IMG_SIZE, use_thumbnail=True
+    )
+    pv = torch.stack([transform(b) for b in blocks]).to(torch.bfloat16).to(
+        next(model.parameters()).device
+    )
+    n_patches   = pv.shape[0]
+    n_img_token = model.num_image_token
+    img_tokens  = "<img>" + "<IMG_CONTEXT>" * n_img_token * n_patches + "</img>"
+
+    # Formato de chat internvl2_5 com backbone Qwen2
+    conv = (
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        f"<|im_start|>user\n{img_tokens}\n{prompt}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    enc = tokenizer(conv, return_tensors="pt").to(next(model.parameters()).device)
+
+    with torch.no_grad():
+        out = model.generate(
+            input_ids=enc["input_ids"],
+            pixel_values=pv,
+            attention_mask=enc["attention_mask"],
+            max_new_tokens=max_new_tokens,
+        )
+    # O InternVL usa inputs_embeds internamente: o output contém só os tokens gerados
+    generated = out[0]
+    if generated.shape[0] > enc["input_ids"].shape[1]:
+        generated = generated[enc["input_ids"].shape[1]:]
+    return tokenizer.decode(generated, skip_special_tokens=True).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -139,34 +255,123 @@ def prepare_qwen2vl(model, processor, image: Image.Image, prompt: str):
 
     return inputs, img_pos, all_text_pos, user_pos, H_eff, W_eff, sys_text
 
+# aliases para interface uniforme com InternVL3 (rows=H_eff, cols=W_eff, block_size=1)
+_prepare_qwen2vl_orig = prepare_qwen2vl
+def prepare_qwen2vl(model, processor, image, prompt):
+    inp, img_pos, all_tp, user_pos, H, W, sys = _prepare_qwen2vl_orig(
+        model, processor, image, prompt)
+    return inp, img_pos, all_tp, user_pos, H, W, sys
+
 
 # ---------------------------------------------------------------------------
-# Cálculo do mapa de atenção a partir do output já computado
+# Cálculo do mapa de atenção
 # ---------------------------------------------------------------------------
+
+def _normalize_spatial(spatial: np.ndarray) -> np.ndarray:
+    """Percentile clip para realçar os patches com maior atenção."""
+    lo = np.percentile(spatial, 50)
+    hi = np.percentile(spatial, 99)
+    if hi > lo:
+        return np.clip((spatial - lo) / (hi - lo), 0, 1)
+    return np.zeros_like(spatial)
+
+
+def _accum_to_spatial(accum: torch.Tensor, rows: int, cols: int,
+                       block_size: int) -> np.ndarray:
+    if block_size > 1:
+        n_spatial = rows * cols
+        accum = accum[: n_spatial * block_size].reshape(n_spatial, block_size).mean(dim=1)
+    return _normalize_spatial(accum.reshape(rows, cols).numpy())
+
 
 def attn_map_from_output(
     out,
     img_pos: torch.Tensor,
     text_pos: torch.Tensor,
-    H_eff: int,
-    W_eff: int,
+    rows: int,
+    cols: int,
     layer_indices: list[int],
+    block_size: int = 1,
 ) -> np.ndarray:
+    """Qwen2.5-VL: usa out.attentions (sequências curtas, sem OOM)."""
+    if out.attentions is None:
+        raise RuntimeError("out.attentions é None — use attn_implementation='eager'.")
+
     n_layers = len(out.attentions)
     resolved = [li % n_layers for li in layer_indices]
-
     accum = torch.zeros(len(img_pos), dtype=torch.float32)
     for li in resolved:
-        attn    = out.attentions[li][0].float().cpu()   # [heads, seq, seq]
-        attn_ti = attn[:, text_pos, :][:, :, img_pos]   # [heads, n_text, n_img]
+        attn    = out.attentions[li][0].float().cpu()
+        attn_ti = attn[:, text_pos, :][:, :, img_pos]
         accum  += attn_ti.mean(dim=(0, 1))
     accum /= len(resolved)
+    return _accum_to_spatial(accum, rows, cols, block_size)
 
-    spatial = accum.reshape(H_eff, W_eff).numpy()
-    lo, hi  = spatial.min(), spatial.max()
-    if hi > lo:
-        spatial = (spatial - lo) / (hi - lo)
-    return spatial
+
+def attn_map_with_hooks(
+    model,
+    inputs: dict,
+    img_pos: torch.Tensor,
+    text_pos: torch.Tensor,
+    rows: int,
+    cols: int,
+    layer_indices: list[int],
+    block_size: int = 1,
+) -> np.ndarray:
+    """
+    InternVL3: extrai atenção via hooks, acumulando na CPU camada a camada.
+    Evita OOM causado por armazenar todas as matrizes de atenção na GPU.
+
+    Patcha temporariamente as camadas alvo para forçar output_attentions=True
+    apenas nelas, sem ativar o flag globalmente (que guardaria tudo na GPU).
+    """
+    lm_layers = model.language_model.model.layers
+    n_layers   = len(lm_layers)
+    resolved   = sorted(set(li % n_layers for li in layer_indices))
+
+    accum      = torch.zeros(len(img_pos), dtype=torch.float32)
+    count      = [0]
+    hooks      = []
+    originals  = {}
+
+    # Patcha cada camada alvo para sempre retornar attn_weights
+    for li in resolved:
+        orig = lm_layers[li].self_attn.forward
+        originals[li] = orig
+
+        def make_patched(orig_fwd):
+            def patched(*args, **kwargs):
+                kwargs["output_attentions"] = True
+                return orig_fwd(*args, **kwargs)
+            return patched
+
+        lm_layers[li].self_attn.forward = make_patched(orig)
+
+    # Hook que captura e acumula na CPU imediatamente
+    def make_hook(li):
+        def hook(module, inp, output):
+            if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
+                attn    = output[1][0].float().cpu()          # [heads, seq, seq]
+                attn_ti = attn[:, text_pos, :][:, :, img_pos] # [heads, n_text, n_img]
+                accum.add_(attn_ti.mean(dim=(0, 1)))
+                count[0] += 1
+        return hook
+
+    for li in resolved:
+        hooks.append(lm_layers[li].self_attn.register_forward_hook(make_hook(li)))
+
+    try:
+        with torch.no_grad():
+            model(**inputs, return_dict=True)   # sem output_attentions global
+    finally:
+        for h in hooks:
+            h.remove()
+        for li, orig in originals.items():
+            lm_layers[li].self_attn.forward = orig
+
+    if count[0] > 0:
+        accum /= count[0]
+    return _accum_to_spatial(accum, rows, cols, block_size)
 
 
 # ---------------------------------------------------------------------------
@@ -202,14 +407,16 @@ def generate_response(model, processor, image: Image.Image, prompt: str,
 
 def overlay_heatmap(image: Image.Image, attn_map: np.ndarray,
                     alpha: float, colormap: str) -> np.ndarray:
-    img_np = np.array(image.convert("RGB"))
+    """Alpha por pixel proporcional à atenção — baixa atenção mostra documento original."""
+    img_np = np.array(image.convert("RGB")).astype(np.float32)
     h, w   = img_np.shape[:2]
     heat   = Image.fromarray((attn_map * 255).astype(np.uint8)).resize(
         (w, h), resample=Image.BILINEAR
     )
-    heat_np  = np.array(heat) / 255.0
-    heat_rgb = (plt.get_cmap(colormap)(heat_np)[:, :, :3] * 255).astype(np.uint8)
-    return (img_np * (1 - alpha) + heat_rgb * alpha).astype(np.uint8)
+    heat_np  = np.array(heat) / 255.0                                   # [h, w] ∈ [0,1]
+    heat_rgb = (plt.get_cmap(colormap)(heat_np)[:, :, :3] * 255)        # [h, w, 3]
+    px_alpha = (heat_np * alpha)[:, :, np.newaxis]                       # por pixel
+    return np.clip(img_np * (1 - px_alpha) + heat_rgb * px_alpha, 0, 255).astype(np.uint8)
 
 
 def _wrap(text: str, width: int = 32) -> str:
@@ -284,50 +491,56 @@ def main():
     else:
         prompts = [(p, p) for p in args.prompts]
 
-    print(f"Carregando {args.model}…")
-    model, processor = load_qwen2vl(args.model)
+    print(f"Carregando {args.model} ({args.family})…")
+    if args.family == "internvl":
+        model, processor = load_internvl(args.model)
+    else:
+        model, processor = load_qwen2vl(args.model)
+
     image = Image.open(args.image).convert("RGB")
 
     n = len(prompts)
-    panels_full = []
-    panels_user = []
+    panels = []
     sys_text_global = ""
 
     for i, (label, prompt) in enumerate(prompts):
         print(f"\n[{i+1}/{n}] {prompt!r}")
 
-        # Prepara inputs e identifica posições de tokens
-        inputs, img_pos, all_text_pos, user_pos, H_eff, W_eff, sys_text = \
-            prepare_qwen2vl(model, processor, image, prompt)
-        sys_text_global = sys_text  # igual para todos os prompts
+        if args.family == "internvl":
+            inp, img_pos, all_text_pos, _, rows, cols, block_size, sys_text = \
+                prepare_internvl(model, processor, image, prompt)
+        else:
+            inp, img_pos, all_text_pos, _, rows, cols, sys_text = \
+                prepare_qwen2vl(model, processor, image, prompt)
+            block_size = 1
+            sys_text_global = sys_text
 
-        print(f"  tokens — system: {len(sys_text_global.split())}, "
-              f"user: {len(user_pos)}, img: {len(img_pos)}")
+        print(f"  tokens — system: {len(sys_text.split()) if sys_text else 0}, "
+              f"text: {len(all_text_pos)}, img: {len(img_pos)}, "
+              f"grid: {rows}×{cols}" + (f", bloco: {block_size}" if block_size > 1 else ""))
 
-        # Um único forward pass com atenção
-        with torch.no_grad():
-            out = model(**inputs, output_attentions=True, return_dict=True)
+        if args.family == "internvl":
+            attn_map = attn_map_with_hooks(
+                model, inp, img_pos, all_text_pos, rows, cols, args.layers, block_size)
+        else:
+            with torch.no_grad():
+                out = model(**dict(**inp, output_attentions=True, return_dict=True))
+            attn_map = attn_map_from_output(
+                out, img_pos, all_text_pos, rows, cols, args.layers, block_size)
 
-        # Dois mapas a partir do mesmo output
-        map_full = attn_map_from_output(out, img_pos, all_text_pos, H_eff, W_eff, args.layers)
-        map_user = attn_map_from_output(out, img_pos, user_pos,     H_eff, W_eff, args.layers)
-
-        # Resposta gerada
-        response = generate_response(model, processor, image, prompt)
+        if args.family == "internvl":
+            response = generate_response_internvl(model, processor, image, prompt)
+        else:
+            response = generate_response(model, processor, image, prompt)
         print(f"  → {response}")
 
-        panels_full.append({"prompt": prompt, "response": response, "attn_map": map_full})
-        panels_user.append({"prompt": prompt, "response": response, "attn_map": map_user})
+        panels.append({"prompt": prompt, "response": response, "attn_map": attn_map})
 
     stem = args.output.removesuffix(".png")
-    make_figure(image, panels_full, sys_text_global,
-                show_sys_text=True,
+    make_figure(image, panels, sys_text_global,
+                show_sys_text=bool(sys_text_global),
                 colormap=args.colormap, alpha=args.alpha,
-                output_path=f"{stem}_full.png")
-    make_figure(image, panels_user, sys_text_global,
-                show_sys_text=False,
-                colormap=args.colormap, alpha=args.alpha,
-                output_path=f"{stem}_user.png")
+                output_path=f"{stem}.png")
 
 
 if __name__ == "__main__":
