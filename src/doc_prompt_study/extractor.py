@@ -58,6 +58,28 @@ def _mean_pool_layer(hidden_states: tuple, layer_idx: int, token_mask: torch.Ten
     return vt.cpu().float()
 
 
+def _balanced_pool_layer(
+    hidden_states: tuple,
+    layer_idx: int,
+    visual_mask: torch.Tensor,
+    text_mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Equal-weight combination of per-modality mean pools.
+
+    Without this, a naive mean over all tokens is ~95% visual for InternVL3
+    (hundreds of <IMG_CONTEXT> tokens vs. ~20 text tokens), making the
+    embedding insensitive to the prompt modality.
+
+    visual_mask / text_mask: bool [1, seq] — True at the respective positions.
+    Returns tensor [dim] float32 on CPU.
+    """
+    h = hidden_states[layer_idx][0].float().cpu()  # [seq, dim]
+    v_pool = h[visual_mask[0]].mean(dim=0) if visual_mask[0].any() else h.mean(dim=0)
+    t_pool = h[text_mask[0]].mean(dim=0) if text_mask[0].any() else h.mean(dim=0)
+    return 0.5 * v_pool + 0.5 * t_pool
+
+
 # ---------------------------------------------------------------------------
 # Base
 # ---------------------------------------------------------------------------
@@ -143,7 +165,14 @@ class InternVLExtractor(BaseExtractor):
         )
         return torch.stack([self._transform(b) for b in blocks])  # [N, 3, H, W]
 
-    def extract_image(self, image, prompt, layers=(0, -1)):
+    def extract_image(self, image, prompt, layers=(0, -1), pooling: str = "all"):
+        """
+        pooling:
+          "all"      — mean over every token (legacy; visual tokens dominate)
+          "visual"   — mean over visual (<IMG_CONTEXT>) tokens only
+          "text"     — mean over text tokens only
+          "balanced" — 0.5 * mean(visual) + 0.5 * mean(text); equal modal weight
+        """
         pv = self._preprocess(image).to(torch.bfloat16)
         inp = self._prepare_inputs(self.model, self.tokenizer, pv, prompt or "")
         with torch.no_grad():
@@ -154,9 +183,79 @@ class InternVLExtractor(BaseExtractor):
                 output_hidden_states=True,
                 return_dict=True,
             )
+
+        if pooling == "balanced":
+            img_ctx_id = self.tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+            seq = inp["input_ids"][0].cpu()
+            visual_mask = (seq == img_ctx_id).unsqueeze(0)
+            text_mask = (seq != img_ctx_id).unsqueeze(0)
+            return {
+                li: _balanced_pool_layer(out.hidden_states, li, visual_mask, text_mask).numpy()
+                for li in layers
+            }
+
+        if pooling == "visual":
+            img_ctx_id = self.tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+            seq = inp["input_ids"][0].cpu()
+            visual_mask = (seq == img_ctx_id).unsqueeze(0)
+            return {
+                li: _mean_pool_layer(out.hidden_states, li, visual_mask).numpy()
+                for li in layers
+            }
+
+        if pooling == "text":
+            img_ctx_id = self.tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+            seq = inp["input_ids"][0].cpu()
+            text_mask = (seq != img_ctx_id).unsqueeze(0)
+            return {
+                li: _mean_pool_layer(out.hidden_states, li, text_mask).numpy()
+                for li in layers
+            }
+
         return {
             li: _mean_pool_layer(out.hidden_states, li, None).numpy()
             for li in layers
+        }
+
+    def extract_tokens(self, image, prompt, layer: int = -1):
+        """
+        Returns the raw hidden states split by modality at a given layer.
+
+        Unlike extract_image(), this exposes the full token tensors so that
+        a PromptGuidedPooler (or any cross-modal module) can consume them
+        directly without a pre-committed pooling strategy.
+
+        Returns
+        -------
+        dict with keys:
+          "visual"  : FloatTensor [1, V, dim] — <IMG_CONTEXT> token hidden states
+          "text"    : FloatTensor [1, T, dim] — text token hidden states
+          "visual_mask" : BoolTensor [1, V]
+          "text_mask"   : BoolTensor [1, T]
+        """
+        pv = self._preprocess(image).to(torch.bfloat16)
+        inp = self._prepare_inputs(self.model, self.tokenizer, pv, prompt or "")
+        with torch.no_grad():
+            out = self.model(
+                input_ids=inp["input_ids"],
+                pixel_values=inp["pixel_values"],
+                image_flags=inp["image_flags"],
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+        h = out.hidden_states[layer][0].float().cpu()  # [seq, dim]
+        img_ctx_id = self.tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+        seq = inp["input_ids"][0].cpu()
+
+        v_idx = (seq == img_ctx_id).nonzero(as_tuple=True)[0]
+        t_idx = (seq != img_ctx_id).nonzero(as_tuple=True)[0]
+
+        return {
+            "visual":       h[v_idx].unsqueeze(0),               # [1, V, D]
+            "text":         h[t_idx].unsqueeze(0),               # [1, T, D]
+            "visual_mask":  torch.ones(1, len(v_idx), dtype=torch.bool),
+            "text_mask":    torch.ones(1, len(t_idx), dtype=torch.bool),
         }
 
     def extract_text(self, text, layers=(0, -1)):
